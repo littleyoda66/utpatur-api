@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Packages / builds
+dist/
+build/
+*.egg-info/
+
+# --- Virtual env ---
+.venv/
+venv/
+env/
+
+# --- IDE / éditeurs ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Système ---
+.DS_Store
+Thumbs.db
+
+# --- Secrets / config locaux ---
+.env
+.env.*
+!.env.example
