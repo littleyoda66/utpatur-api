@@ -6,6 +6,7 @@ from typing import List, Optional
 import os
 from dotenv import load_dotenv
 
+# Charger les variables d'environnement depuis .env en local
 load_dotenv()
 
 NEO4J_URI = os.environ["NEO4J_URI"]
@@ -16,22 +17,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 app = FastAPI(title="UtPaTur API")
 
-@app.on_event("shutdown")
-def close_driver():
-    driver.close()
-
-@app.get("/health")
-def health():
-    # Petite requête test pour vérifier la connexion AuraDB
-    with driver.session() as session:
-        result = session.run("MATCH (h:Hut) RETURN count(h) AS huts LIMIT 1")
-        record = result.single()
-        return {
-            "status": "ok",
-            "huts_count_sample": record["huts"] if record else 0,
-        }
-
-# --- CORS (pour que le frontend puisse appeler l'API) ---
+# --- CORS : on ouvrira plus finement plus tard ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # plus tard: ["https://utpatur.app", "https://www.utpatur.app"]
@@ -42,7 +28,7 @@ app.add_middleware(
 
 
 class Hut(BaseModel):
-    hut_id: int
+    hut_id: Optional[int] = None
     name: Optional[str] = None
     latitude: float
     longitude: float
