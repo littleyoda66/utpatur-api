@@ -38,6 +38,8 @@ class Hut(BaseModel):
     shelter_type: Optional[str] = None
     operator: Optional[str] = None
     osm_id: Optional[int] = None
+    routes_codes: Optional[List[str]] = None
+    routes_labels: Optional[List[str]] = None
 
 
 @app.on_event("shutdown")
@@ -86,6 +88,8 @@ def list_huts(limit: int = 200):
                     "shelter_type": node.get("shelter_type"),
                     "operator": node.get("operator"),
                     "osm_id": node.get("osm_id"),
+                    "routes_codes": node.get("routes_codes"),
+                    "routes_labels": node.get("routes_labels"),
                 }
             )
 
