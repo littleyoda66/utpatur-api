@@ -10,13 +10,13 @@ from admin_router import router as admin_router
 # ------------------------------------------------------------------
 
 NEO4J_URI = os.environ.get("NEO4J_URI")
-NEO4J_USER = os.environ.get("NEO4J_USER")
+NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD")
 
-if not all([NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD]):
-    raise RuntimeError("NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD doivent être définies dans l'environnement.")
+if not all([NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD]):
+    raise RuntimeError("NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD doivent être définies dans l'environnement.")
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
 # ------------------------------------------------------------------
 # FastAPI app
