@@ -9,15 +9,8 @@ from neo4j import GraphDatabase, exceptions
 # Connexion Neo4j / AuraDB
 # -------------------------------------------------------------------
 
-NEO4J_URI = os.getenv("NEO4J_URI") or os.getenv("AURA_URI")
-
-# Canonique : NEO4J_USERNAME, mais on accepte aussi NEO4J_USER / AURA_USER
-NEO4J_USERNAME = (
-    os.getenv("NEO4J_USERNAME")
-    or os.getenv("NEO4J_USER")
-    or os.getenv("AURA_USER")
-)
-
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or os.getenv("AURA_PASSWORD")
 
 if not (NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD):
