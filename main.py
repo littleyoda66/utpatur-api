@@ -62,7 +62,7 @@ def on_shutdown():
 # ------------------------------------------------------------------
 
 @app.get("/")
-def root():
+async def root():
     return {"status": "ok", "service": "utpatur-api"}
 
 
