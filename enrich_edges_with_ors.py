@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NEO4J_URI = os.environ["NEO4J_URI"]
-NEO4J_USER = os.environ["NEO4J_USERNAME"]
+NEO4J_USERNAME = os.environ["NEO4J_USERNAME"]
 NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
 
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
@@ -22,10 +22,11 @@ if not ORS_API_KEY:
         "Définis-la (par ex. dans .env) avant de lancer le script."
     )
 
-# Profil rando
+# Profil rando - par défaut, format JSON avec polyligne encodée
+# (data["routes"][0]["geometry"])
 ORS_URL = "https://api.openrouteservice.org/v2/directions/foot-hiking"
 
-# Batchs pour éviter de flinguer le quota ORS
+# Batchs pour éviter d'exploser le quota ORS
 BATCH_SIZE = 20
 SLEEP_BETWEEN_CALLS = 2.0  # secondes
 
@@ -34,7 +35,7 @@ SLEEP_BETWEEN_CALLS = 2.0  # secondes
 # Connexion Neo4j
 # -------------------------------------------------------------------
 def get_driver():
-    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
 
 # -------------------------------------------------------------------
@@ -42,14 +43,17 @@ def get_driver():
 # -------------------------------------------------------------------
 def fetch_links_to_enrich(session, limit=BATCH_SIZE):
     """
-    Récupère des liens (a:Hut)-[l:LINK]->(b:Hut) où l.distance_km IS NULL
-    avec IDs, noms et coordonnées.
+    Récupère des liens (a:Hut)-[l:LINK]->(b:Hut) à enrichir avec ORS.
 
-    On s'appuie sur la propriété a.hut_id / b.hut_id (type entier).
+    On cible les liens pour lesquels :
+      - la géométrie n'est pas encore définie (l.geometry_polyline IS NULL)
+      - ET qui ne sont pas marqués comme ors_skip = true
+      - ET dont les huts ont des coordonnées valides.
     """
     query = """
     MATCH (a:Hut)-[l:LINK]->(b:Hut)
-    WHERE l.distance_km IS NULL
+    WHERE l.geometry_polyline IS NULL
+      AND coalesce(l.ors_skip, false) = false
       AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
       AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
     RETURN
@@ -68,19 +72,67 @@ def fetch_links_to_enrich(session, limit=BATCH_SIZE):
 
 
 # -------------------------------------------------------------------
+# Marquer un lien comme à ignorer (échec ORS définitif)
+# -------------------------------------------------------------------
+def mark_link_as_failed(session, from_id, to_id, reason: str):
+    """
+    Marque le lien (a)-[l:LINK]->(b) comme à ignorer pour les prochains runs.
+    On stocke aussi un petit message explicatif dans l.ors_reason.
+    """
+    query = """
+    MATCH (a:Hut {hut_id: $from_id})-[l:LINK]->(b:Hut {hut_id: $to_id})
+    SET l.ors_skip   = true,
+        l.ors_reason = $reason
+    RETURN count(l) AS updated_count
+    """
+    result = session.run(
+        query,
+        from_id=from_id,
+        to_id=to_id,
+        reason=reason[:500],
+    )
+    record = result.single()
+    return record["updated_count"] if record and "updated_count" in record else 0
+
+
+# -------------------------------------------------------------------
+# Supprimer les liens self (même hut_id des deux côtés)
+# -------------------------------------------------------------------
+def delete_self_link(session, hut_id: int):
+    """
+    Supprime tous les liens (a:Hut {hut_id})-[l:LINK]->(b:Hut {hut_id})
+    où le hut_id est identique des deux côtés, même si a et b sont
+    deux nodes Neo4j différents.
+    """
+    query = """
+    MATCH (a:Hut {hut_id: $hut_id})-[l:LINK]->(b:Hut {hut_id: $hut_id})
+    DELETE l
+    RETURN count(l) AS deleted_count
+    """
+    result = session.run(query, hut_id=hut_id)
+    record = result.single()
+    return record["deleted_count"] if record and "deleted_count" in record else 0
+
+
+# -------------------------------------------------------------------
 # Appel ORS pour une paire de huts
 # -------------------------------------------------------------------
 def call_ors(from_lon, from_lat, to_lon, to_lat, from_name="?", to_name="?"):
     """
     Appelle ORS entre deux points [lon, lat].
-    Retourne (distance_km, dplus_m, dminus_m) ou None en cas d'erreur.
+
+    Retourne (distance_km, dplus_m, dminus_m, geometry_polyline)
+    ou None en cas d'erreur liée à ce lien.
+
+    En cas de dépassement de quota (429), on lève une RuntimeError
+    pour arrêter proprement le script.
     """
     body = {
         "coordinates": [
             [from_lon, from_lat],  # ORS = [lon, lat]
             [to_lon, to_lat],
         ],
-        "elevation": True,
+        "elevation": True,  # pour récupérer ascent / descent dans le summary
     }
 
     headers = {
@@ -93,6 +145,11 @@ def call_ors(from_lon, from_lat, to_lon, to_lat, from_name="?", to_name="?"):
     except Exception as e:
         print(f"  ERREUR réseau ORS pour {from_name} -> {to_name}: {e}")
         return None
+
+    if resp.status_code == 429:
+        # Rate limit global : on arrête le script proprement
+        print(f"  ERREUR ORS 429 (Rate Limit Exceeded) pour {from_name} -> {to_name}")
+        raise RuntimeError("ORS rate limit exceeded (HTTP 429)")
 
     if resp.status_code != 200:
         print(f"  ERREUR ORS {resp.status_code} pour {from_name} -> {to_name}")
@@ -112,59 +169,75 @@ def call_ors(from_lon, from_lat, to_lon, to_lat, from_name="?", to_name="?"):
             pass
         return None
 
-    summary = None
+    distance_m = None
+    ascent = 0.0
+    descent = 0.0
+    geometry_polyline = None
 
-    # Format GeoJSON (features)
-    if isinstance(data, dict) and "features" in data:
+    # Format JSON "classique" : data["routes"][0]
+    if isinstance(data, dict) and "routes" in data:
+        try:
+            route = data["routes"][0]
+            summary = route.get("summary", {})
+            distance_m = float(summary["distance"])
+            ascent = float(summary.get("ascent", 0.0))
+            descent = float(summary.get("descent", 0.0))
+            geometry_polyline = route.get("geometry")
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            print(f"  ERREUR parsing 'routes' pour {from_name} -> {to_name}: {e}")
+            return None
+
+    # Ancien format GeoJSON (features) - fallback
+    elif isinstance(data, dict) and "features" in data:
         try:
             feature = data["features"][0]
             props = feature.get("properties", {})
             summary = props.get("summary", {})
-        except (KeyError, IndexError, TypeError) as e:
+            distance_m = float(summary.get("distance", props.get("distance")))
+            ascent = float(summary.get("ascent", props.get("ascent", 0.0)))
+            descent = float(summary.get("descent", props.get("descent", 0.0)))
+            # On n'a pas de polyline encodée ici, juste une géométrie GeoJSON.
+            # On pourrait la convertir, mais pour l'instant on stocke une string vide.
+            geometry_polyline = ""
+        except (KeyError, IndexError, TypeError, ValueError) as e:
             print(f"  ERREUR parsing 'features' pour {from_name} -> {to_name}: {e}")
             return None
 
-    # Ancien format JSON (routes)
-    elif isinstance(data, dict) and "routes" in data:
-        try:
-            route = data["routes"][0]
-            summary = route.get("summary", {})
-        except (KeyError, IndexError, TypeError) as e:
-            print(f"  ERREUR parsing 'routes' pour {from_name} -> {to_name}: {e}")
-            return None
-
     else:
-        print(f"  Réponse ORS inattendue pour {from_name} -> {to_name}: ni 'features' ni 'routes'")
+        print(f"  Réponse ORS inattendue pour {from_name} -> {to_name}: ni 'routes' ni 'features'")
         return None
 
-    try:
-        distance_m = float(summary["distance"])
-        ascent = float(summary.get("ascent", 0.0))
-        descent = float(summary.get("descent", 0.0))
-    except (KeyError, ValueError, TypeError) as e:
-        print(f"  ERREUR lecture summary pour {from_name} -> {to_name}: {e}")
+    if distance_m is None:
+        print(f"  ERREUR: distance manquante dans la réponse ORS pour {from_name} -> {to_name}")
+        return None
+
+    if geometry_polyline is None:
+        # Cas anormal en JSON moderne : on préfère marquer en échec
+        print(f"  ERREUR: pas de geometry_polyline pour {from_name} -> {to_name}")
         return None
 
     distance_km = distance_m / 1_000.0
-    return distance_km, ascent, descent
+    return distance_km, ascent, descent, geometry_polyline
 
 
 # -------------------------------------------------------------------
 # Mise à jour d'un lien en base, via hut_id
 # -------------------------------------------------------------------
-def update_link_in_neo4j(session, from_id, to_id, distance_km, dplus_m, dminus_m):
+def update_link_in_neo4j(session, from_id, to_id, distance_km, dplus_m, dminus_m, geometry_polyline):
     """
     Met à jour le lien (a)-[l:LINK]->(b) identifié par les hut_id.
-    On suppose que a.hut_id / b.hut_id sont uniques.
+
+    On met à jour distance_km / dplus_m / dminus_m ET geometry_polyline.
     """
     query = """
     MATCH (a:Hut {hut_id: $from_id}),
           (b:Hut {hut_id: $to_id})
     MATCH (a)-[l:LINK]->(b)
-    SET l.distance_km = $distance_km,
-        l.dplus_m     = $dplus_m,
-        l.dminus_m    = $dminus_m
-    RETURN id(l) AS link_id
+    SET l.distance_km       = $distance_km,
+        l.dplus_m           = $dplus_m,
+        l.dminus_m          = $dminus_m,
+        l.geometry_polyline = $geometry_polyline
+    RETURN count(l) AS updated_count
     """
     result = session.run(
         query,
@@ -173,9 +246,10 @@ def update_link_in_neo4j(session, from_id, to_id, distance_km, dplus_m, dminus_m
         distance_km=float(distance_km),
         dplus_m=float(dplus_m),
         dminus_m=float(dminus_m),
+        geometry_polyline=geometry_polyline,
     )
     record = result.single()
-    return record["link_id"] if record else None
+    return record["updated_count"] if record and "updated_count" in record else 0
 
 
 # -------------------------------------------------------------------
@@ -183,61 +257,84 @@ def update_link_in_neo4j(session, from_id, to_id, distance_km, dplus_m, dminus_m
 # -------------------------------------------------------------------
 def main():
     driver = get_driver()
-    with driver.session() as session:
-        while True:
-            links = fetch_links_to_enrich(session, limit=BATCH_SIZE)
-            if not links:
-                print("Plus aucun lien à enrichir, terminé.")
-                break
+    try:
+        with driver.session() as session:
+            while True:
+                links = fetch_links_to_enrich(session, limit=BATCH_SIZE)
+                if not links:
+                    print("Plus aucun lien à enrichir, terminé.")
+                    break
 
-            print(f"Traitement d’un batch de {len(links)} liens…")
+                print(f"Traitement d’un batch de {len(links)} liens…")
 
-            for rec in links:
-                from_id = rec["from_id"]
-                to_id = rec["to_id"]
-                from_name = rec["from_name"]
-                to_name = rec["to_name"]
-                from_lon = rec["from_lon"]
-                from_lat = rec["from_lat"]
-                to_lon = rec["to_lon"]
-                to_lat = rec["to_lat"]
+                for rec in links:
+                    from_id = rec["from_id"]
+                    to_id = rec["to_id"]
+                    from_name = rec["from_name"]
+                    to_name = rec["to_name"]
+                    from_lon = rec["from_lon"]
+                    from_lat = rec["from_lat"]
+                    to_lon = rec["to_lon"]
+                    to_lat = rec["to_lat"]
 
-                print(f"- ORS: {from_name} (#{from_id}) -> {to_name} (#{to_id})")
+                    # Self-link logique : même hut_id des deux côtés
+                    if from_id == to_id:
+                        print(
+                            f"- SELF-LINK détecté: {from_name} (#{from_id}) -> {to_name} (#{to_id}), suppression du/des lien(s)…"
+                        )
+                        deleted_count = delete_self_link(session, from_id)
+                        print(f"  -> {deleted_count} relation(s) supprimée(s)")
+                        continue
 
-                result = call_ors(
-                    from_lon,
-                    from_lat,
-                    to_lon,
-                    to_lat,
-                    from_name=from_name,
-                    to_name=to_name,
-                )
+                    print(f"- ORS: {from_name} (#{from_id}) -> {to_name} (#{to_id})")
 
-                if result is None:
-                    print("  -> échec ORS, on passe au suivant.")
-                    continue
+                    try:
+                        result = call_ors(
+                            from_lon,
+                            from_lat,
+                            to_lon,
+                            to_lat,
+                            from_name=from_name,
+                            to_name=to_name,
+                        )
+                    except RuntimeError as e:
+                        # Cas typique : quota ORS dépassé (429)
+                        print(f"  -> arrêt du script: {e}")
+                        return
 
-                distance_km, dplus_m, dminus_m = result
+                    if result is None:
+                        print("  -> échec ORS, on marque le lien comme ors_skip et on passe au suivant.")
+                        mark_link_as_failed(
+                            session,
+                            from_id,
+                            to_id,
+                            "ORS error (voir logs du script)",
+                        )
+                        continue
 
-                link_id = update_link_in_neo4j(
-                    session,
-                    from_id,
-                    to_id,
-                    distance_km,
-                    dplus_m,
-                    dminus_m,
-                )
+                    distance_km, dplus_m, dminus_m, geometry_polyline = result
 
-                print(
-                    f"  OK: link_id={link_id}, "
-                    f"{distance_km:.2f} km, "
-                    f"D+={math.floor(dplus_m)} m, "
-                    f"D-={math.floor(dminus_m)} m"
-                )
+                    updated_count = update_link_in_neo4j(
+                        session,
+                        from_id,
+                        to_id,
+                        distance_km,
+                        dplus_m,
+                        dminus_m,
+                        geometry_polyline,
+                    )
 
-                time.sleep(SLEEP_BETWEEN_CALLS)
+                    print(
+                        f"  OK: {updated_count} lien(s) mis à jour, "
+                        f"{distance_km:.2f} km, "
+                        f"D+={math.floor(dplus_m)} m, "
+                        f"D-={math.floor(dminus_m)} m, "
+                        f"len(polyline)={len(geometry_polyline) if geometry_polyline else 0}"
+                    )
 
-    driver.close()
+                    time.sleep(SLEEP_BETWEEN_CALLS)
+    finally:
+        driver.close()
 
 
 if __name__ == "__main__":
