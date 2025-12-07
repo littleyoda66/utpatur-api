@@ -65,12 +65,24 @@ class Hut(BaseModel):
     country_code: Optional[str] = None
 
 
+class RouteStep(BaseModel):
+    from_hut_id: int
+    to_hut_id: int
+    distance_km: float
+    dplus_m: float
+    dminus_m: float
+    geometry_polyline: Optional[str] = None
+    ors_skip: bool = False
+
+
 class ReachableHut(Hut):
     total_distance_km: float
     total_dplus_m: float
     total_dminus_m: float
     segments: int
     via: Optional[str] = None
+    steps: List[RouteStep]
+
 
 
 # -------------------------------------------------------------------
@@ -199,6 +211,8 @@ async def get_reachable_huts(
 
     // on calcule le "via" si exactement 2 segments
     WITH dest,
+         p,
+         rels,
          total_distance_km,
          total_dplus_m,
          total_dminus_m,
@@ -216,7 +230,8 @@ async def get_reachable_huts(
            total_dplus_m:     total_dplus_m,
            total_dminus_m:    total_dminus_m,
            segments:          segments,
-           via:               via
+           via:               via,
+           rels:              rels
          })) AS best
 
     RETURN
@@ -224,14 +239,23 @@ async def get_reachable_huts(
       dest.name               AS name,
       dest.latitude           AS latitude,
       dest.longitude          AS longitude,
+      dest.country_code       AS country_code,
       best.total_distance_km  AS total_distance_km,
       best.total_dplus_m      AS total_dplus_m,
       best.total_dminus_m     AS total_dminus_m,
       best.segments           AS segments,
-      best.via                AS via
+      best.via                AS via,
+      [r IN best.rels | {
+        from_hut_id:        startNode(r).hut_id,
+        to_hut_id:          endNode(r).hut_id,
+        distance_km:        coalesce(r.distance_km, 0.0),
+        dplus_m:            coalesce(toFloat(r.dplus_m), 0.0),
+        dminus_m:           coalesce(toFloat(r.dminus_m), 0.0),
+        geometry_polyline:  r.geometry_polyline,
+        ors_skip:           coalesce(r.ors_skip, false)
+      }] AS steps
     ORDER BY total_distance_km ASC, name ASC
     """
-
     rows = run_query(
         cypher,
         {
