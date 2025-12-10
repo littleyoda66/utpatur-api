@@ -87,6 +87,42 @@ async def search_huts(
     
     return rows
 
+@router.get(
+    "/trailheads",
+    summary="Points d'accès en transports publics",
+    description="Retourne les cabanes accessibles en transports publics avec les détails de connexion"
+)
+async def get_trailheads():
+    """
+    Récupère toutes les cabanes marquées comme Trailhead (points d'entrée/sortie)
+    avec leurs informations de transport public.
+    """
+    logger.info("Liste des trailheads demandée")
+    
+    cypher = """
+    MATCH (h:Hut:Trailhead)
+    OPTIONAL MATCH (h)-[r:ACCESSIBLE_FROM]->(t:TransportHub)
+    RETURN
+      h.hut_id       AS hut_id,
+      h.name         AS name,
+      h.latitude     AS latitude,
+      h.longitude    AS longitude,
+      h.country_code AS country_code,
+      CASE WHEN r IS NOT NULL THEN {
+        mode: r.mode,
+        line: r.line,
+        duration: r.duration,
+        hub: t.name,
+        seasonal: COALESCE(r.seasonal, false)
+      } ELSE null END AS transport
+    ORDER BY h.name
+    """
+    
+    rows = run_query(cypher, {})
+    logger.info(f"✓ {len(rows)} trailheads retournés")
+    
+    return rows
+
 
 @router.get(
     "/{hut_id}",
@@ -253,3 +289,4 @@ async def get_reachable_huts(
         count=len(rows),
         huts=rows,
     )
+    
