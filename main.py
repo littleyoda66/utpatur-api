@@ -9,7 +9,8 @@ from fastapi.responses import JSONResponse
 from config import get_settings
 from db import get_driver, close_driver, verify_connection, create_indexes
 from models import HealthResponse
-from routers import huts, admin
+from routers import huts, admin, export
+
 
 # Configuration du logging
 logging.basicConfig(
@@ -147,5 +148,6 @@ async def global_exception_handler(request, exc):
 # Inclusion des routers
 app.include_router(huts.router, prefix="/api/v1")
 app.include_router(admin.router, prefix="/api/v1")
+app.include_router(export.router, prefix="/api/v1")
 
 logger.info(f"✓ Routes configurées: {len(app.routes)} routes")
