@@ -3,5 +3,5 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
 neo4j==5.27.0
-requests==2.32.3
+requests==2.32.4
 python-dotenv==1.0.1
