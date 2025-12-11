@@ -111,7 +111,7 @@ async def get_trailheads():
       CASE WHEN r IS NOT NULL THEN {
         mode: r.mode,
         line: r.line,
-        duration: r.duration,
+        duration: r.duration_min,
         hub: t.name,
         seasonal: COALESCE(r.seasonal, false)
       } ELSE null END AS transport
